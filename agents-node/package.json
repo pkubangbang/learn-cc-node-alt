@@ -1,0 +1,35 @@
+{
+  "name": "learn-claude-code-node",
+  "version": "0.1.0",
+  "description": "Node.js agent implementations using Ollama - harness engineering for AI agents",
+  "type": "module",
+  "scripts": {
+    "s01": "tsx src/s01_agent_loop.ts",
+    "s02": "tsx src/s02_tool_use.ts",
+    "s03": "tsx src/s03_todo_write.ts",
+    "s04": "tsx src/s04_subagent.ts",
+    "s05": "tsx src/s05_skill_loading.ts",
+    "s06": "tsx src/s06_context_compact.ts",
+    "s07": "tsx src/s07_task_system.ts",
+    "s08": "tsx src/s08_background_tasks.ts",
+    "s09": "tsx src/s09_agent_teams.ts",
+    "s10": "tsx src/s10_team_protocols.ts",
+    "s11": "tsx src/s11_autonomous_agents.ts",
+    "s12": "tsx src/s12_worktree_task_isolation.ts",
+    "s-full": "tsx src/s_full.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\""
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "ollama": "^0.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "prettier": "^3.4.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  }
+}
