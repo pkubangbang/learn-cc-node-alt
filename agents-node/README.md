@@ -6,26 +6,53 @@ This is the Node.js equivalent of the Python `agents/` directory, following the 
 
 ## Quick Start
 
+### 1. Install Dependencies
+
 ```bash
-# Install dependencies
 npm install
+```
 
-# Configure environment (already set up with defaults)
-# Edit .env if needed
-cat .env
+### 2. Set Up Ollama
 
-# Run sessions
+Install Ollama from [ollama.com](https://ollama.com) or run it via Docker:
+
+```bash
+# Using Docker
+docker run -d -p 11434:11434 ollama/ollama
+
+# Or install natively and run
+ollama serve
+```
+
+Pull the model you want to use:
+
+```bash
+ollama pull glm-5:cloud
+# or any other model like: ollama pull llama3
+```
+
+### 3. Configure Environment
+
+Create a `.env` file (or copy from `.env.example`):
+
+```env
+# Ollama server URL (default: http://127.0.0.1:11434)
+OLLAMA_HOST=http://127.0.0.1:11434
+
+# Model to use (default: glm-5:cloud)
+OLLAMA_MODEL=glm-5:cloud
+
+# Optional: API key for authenticated Ollama instances
+OLLAMA_API_KEY=your-api-key-here
+```
+
+### 4. Run Sessions
+
+```bash
 npm run s01    # Minimal agent loop
 npm run s02    # Tool use
 npm run s03    # TodoWrite
 # ... up to s12 and s-full
-```
-
-## Environment
-
-```env
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=glm-5:cloud
 ```
 
 ## Architecture
