@@ -362,12 +362,12 @@ async function agentLoop(messages: Message[]): Promise<number> {
       } else {
         console.log(`> ${toolName}: ${output.slice(0, 200)}`);
       }
-      
+
       const toolCallId = (toolCall as Record<string, any>).id || '<unknown>';
       const brief = `tool call ${toolCall.function.name}#${toolCallId} finished. `;
       toolResults.push({
         role: 'tool',
-        content: brief + output
+        content: brief + output,
       });
     }
 
