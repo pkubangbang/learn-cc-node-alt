@@ -32,25 +32,15 @@ import * as readline from 'readline';
 import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Ollama, type Message, type Tool } from 'ollama';
-import 'dotenv/config';
+import * as os from 'os';
+import { type Message, type Tool } from 'ollama';
+import { ollama, MODEL } from './ollama.js';
 import chalk from 'chalk';
-
-// Configuration
-const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
-const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
-const MODEL = process.env.OLLAMA_MODEL || 'glm-5:cloud';
 
 const WORKDIR = process.cwd();
 const SYSTEM = `You are a coding agent at ${WORKDIR}.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose.`;
-
-// Initialize Ollama client
-const ollama = new Ollama({
-  host: OLLAMA_HOST,
-  ...(OLLAMA_API_KEY ? { headers: { Authorization: `Bearer ${OLLAMA_API_KEY}` } } : {}),
-});
 
 // -- TodoManager: structured state the LLM writes to --
 interface TodoItem {
@@ -372,10 +362,12 @@ async function agentLoop(messages: Message[]): Promise<number> {
       } else {
         console.log(`> ${toolName}: ${output.slice(0, 200)}`);
       }
-
+      
+      const toolCallId = (toolCall as Record<string, any>).id || '<unknown>';
+      const brief = `tool call ${toolCall.function.name}#${toolCallId} finished. `;
       toolResults.push({
         role: 'tool',
-        content: output,
+        content: brief + output
       });
     }
 
@@ -390,6 +382,26 @@ async function agentLoop(messages: Message[]): Promise<number> {
     }
 
     messages.push(...toolResults);
+  }
+}
+
+// Save conversation history to temp log file
+function saveHistoryToLog(history: Message[]): void {
+  const tempDir = os.tmpdir();
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const logFile = path.join(tempDir, `s03-history-${timestamp}.json`);
+
+  const logData = {
+    timestamp: new Date().toISOString(),
+    model: MODEL,
+    messages: history,
+  };
+
+  try {
+    fs.writeFileSync(logFile, JSON.stringify(logData, null, 2), 'utf-8');
+    console.log(chalk.dim(`History saved to: ${logFile}`));
+  } catch (error) {
+    console.error(chalk.red(`Failed to save history: ${(error as Error).message}`));
   }
 }
 
@@ -411,6 +423,7 @@ async function main() {
     try {
       const query = await prompt(chalk.cyan('s03 >> '));
       if (['q', 'exit', ''].includes(query.trim().toLowerCase())) {
+        saveHistoryToLog(history);
         break;
       }
       history.push({ role: 'user', content: query });

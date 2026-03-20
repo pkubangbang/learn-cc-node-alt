@@ -13,3 +13,5 @@ The working directory should be confined to `agents-node`, the programming langu
 The core library is `ollama`, the usage is explained in `OLLAMA-README.md`.
 
 **Reference**: The reference project is in `agents` folder.
+
+**CoAuthor**: This project use ollama with glm-5:cloud. When commiting the changes, notice the communication section.

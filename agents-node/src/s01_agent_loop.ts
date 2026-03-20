@@ -27,22 +27,11 @@
 
 import * as readline from 'readline';
 import { execSync } from 'child_process';
-import { Ollama, type Message, type Tool } from 'ollama';
-import 'dotenv/config';
-
-// Configuration
-const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
-const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY;
-const MODEL = process.env.OLLAMA_MODEL || 'glm-5:cloud';
+import { type Message, type Tool } from 'ollama';
+import { ollama, MODEL } from './ollama.js';
 
 const WORKDIR = process.cwd();
 const SYSTEM = `You are a coding agent at ${WORKDIR}. Use bash to solve tasks. Act, don't explain.`;
-
-// Initialize Ollama client
-const ollama = new Ollama({
-  host: OLLAMA_HOST,
-  ...(OLLAMA_API_KEY ? { headers: { Authorization: `Bearer ${OLLAMA_API_KEY}` } } : {}),
-});
 
 // Tool definitions for Ollama
 const TOOLS: Tool[] = [
