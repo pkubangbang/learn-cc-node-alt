@@ -1,50 +1,42 @@
 #!/usr/bin/env node
 /**
- * s09_agent_teams.ts - Agent Teams
+ * s11_autonomous_agents.ts - Autonomous Agents
  *
- * Harness: team mailboxes -- multiple models, coordinated through files.
+ * Harness: autonomy -- models that find work without being told.
  *
- * Persistent named agents with file-based JSONL inboxes. Each teammate runs
- * its own agent loop as an async function. Communication via append-only inboxes.
+ * Idle cycle with task board polling, auto-claiming unclaimed tasks, and
+ * identity re-injection after context compression. Builds on s10's protocols.
  *
- *     Subagent (s04):  spawn -> execute -> return summary -> destroyed
- *     Teammate (s09):  spawn -> work -> idle -> work -> ... -> shutdown
+ *     Teammate lifecycle:
+ *     +-------+
+ *     | spawn |
+ *     +---+---+
+ *         |
+ *         v
+ *     +-------+  tool_use    +-------+
+ *     | WORK  | <----------> |  LLM  |
+ *     +---+---+              +-------+
+ *         |
+ *         | stop_reason != tool_use OR idle tool
+ *         v
+ *     +--------+
+ *     | IDLE   | poll every 5s for up to 60s
+ *     +---+----+
+ *         |
+ *         +---> check inbox -> message? -> resume WORK
+ *         |
+ *         +---> scan .tasks/ -> unclaimed? -> claim -> resume WORK
+ *         |
+ *         +---> timeout (60s) -> shutdown
  *
- *     .team/config.json                   .team/inbox/
- *     +----------------------------+      +------------------+
- *     | {"team_name": "default",   |      | alice.jsonl      |
- *     |  "members": [              |      | bob.jsonl        |
- *     |    {"name":"alice",        |      | lead.jsonl       |
- *     |     "role":"coder",        |      +------------------+
- *     |     "status":"idle"}       |
- *     |  ]}                        |      send_message("alice", "fix bug"):
- *     +----------------------------+        open("alice.jsonl", "a").write(msg)
+ *     Identity re-injection after compression:
+ *     messages = [identity_block, ...remaining...]
+ *     "You are 'coder', role: backend, team: my-team"
  *
- *                                        read_inbox("alice"):
- *     spawn_teammate("alice","coder",...)   msgs = [json.loads(l) for l in ...]
- *         |                                open("alice.jsonl", "w").close()
- *         v                                return msgs  # drain
- *     Async: alice             Async: bob
- *     +------------------+      +------------------+
- *     | agent_loop       |      | agent_loop       |
- *     | status: working  |      | status: idle     |
- *     | ... runs tools   |      | ... waits ...    |
- *     | status -> idle   |      |                  |
- *     +------------------+      +------------------+
+ * Key insight: "The agent finds work itself."
  *
- *     5 message types (all declared, not all handled here):
- *     +-------------------------+-----------------------------------+
- *     | message                 | Normal text message               |
- *     | broadcast               | Sent to all teammates             |
- *     | shutdown_request        | Request graceful shutdown (s10)   |
- *     | shutdown_response       | Approve/reject shutdown (s10)     |
- *     | plan_approval_response  | Approve/reject plan (s10)         |
- *     +-------------------------+-----------------------------------+
- *
- * Key insight: "Teammates that can talk to each other."
- *
- * In Node.js, we use async functions with the event loop for concurrency
- * instead of Python's threading module.
+ * In Node.js, we use async/await with setTimeout for polling instead of
+ * Python's threading and time.sleep.
  */
 
 import * as readline from 'readline';
@@ -58,9 +50,13 @@ import chalk from 'chalk';
 const WORKDIR = process.cwd();
 const TEAM_DIR = path.join(WORKDIR, '.team');
 const INBOX_DIR = path.join(TEAM_DIR, 'inbox');
+const TASKS_DIR = path.join(WORKDIR, '.tasks');
 const TRANSCRIPTS_DIR = path.join(WORKDIR, '.transcripts');
 
-const SYSTEM = `You are a team lead at ${WORKDIR}. Spawn teammates and communicate via inboxes.`;
+const POLL_INTERVAL = 5000; // 5 seconds
+const IDLE_TIMEOUT = 60000; // 60 seconds
+
+const SYSTEM = `You are a team lead at ${WORKDIR}. Teammates are autonomous -- they find work themselves.`;
 
 const VALID_MSG_TYPES = [
   'message',
@@ -69,6 +65,68 @@ const VALID_MSG_TYPES = [
   'shutdown_response',
   'plan_approval_response',
 ];
+
+// -- Request trackers --
+interface ShutdownRequest {
+  target: string;
+  status: 'pending' | 'approved' | 'rejected';
+}
+
+interface PlanRequest {
+  from: string;
+  plan: string;
+  status: 'pending' | 'approved' | 'rejected';
+}
+
+const shutdownRequests: Map<string, ShutdownRequest> = new Map();
+const planRequests: Map<string, PlanRequest> = new Map();
+
+// -- Task board scanning --
+interface Task {
+  id: number;
+  subject: string;
+  description?: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  owner?: string;
+  blockedBy?: number[];
+}
+
+function scanUnclaimedTasks(): Task[] {
+  if (!fs.existsSync(TASKS_DIR)) {
+    fs.mkdirSync(TASKS_DIR, { recursive: true });
+    return [];
+  }
+  const unclaimed: Task[] = [];
+  const files = fs.readdirSync(TASKS_DIR).filter((f) => f.startsWith('task_') && f.endsWith('.json')).sort();
+  for (const file of files) {
+    const taskPath = path.join(TASKS_DIR, file);
+    try {
+      const task = JSON.parse(fs.readFileSync(taskPath, 'utf-8')) as Task;
+      if (task.status === 'pending' && !task.owner && !task.blockedBy?.length) {
+        unclaimed.push(task);
+      }
+    } catch {
+      // Skip malformed task files
+    }
+  }
+  return unclaimed;
+}
+
+function claimTask(taskId: number, owner: string): string {
+  const taskPath = path.join(TASKS_DIR, `task_${taskId}.json`);
+  if (!fs.existsSync(taskPath)) {
+    return `Error: Task ${taskId} not found`;
+  }
+  try {
+    const task = JSON.parse(fs.readFileSync(taskPath, 'utf-8')) as Task;
+    task.owner = owner;
+    task.status = 'in_progress';
+    fs.writeFileSync(taskPath, JSON.stringify(task, null, 2), 'utf-8');
+    return `Claimed task #${taskId} for ${owner}`;
+  } catch {
+    return `Error: Failed to claim task ${taskId}`;
+  }
+}
 
 // -- MessageBus: JSONL inbox per teammate --
 interface MessagePayload {
@@ -141,7 +199,15 @@ class MessageBus {
 
 const BUS = new MessageBus(INBOX_DIR);
 
-// -- TeammateManager: persistent named agents with config.json --
+// -- Identity re-injection after compression --
+function makeIdentityBlock(name: string, role: string, teamName: string): Message {
+  return {
+    role: 'user',
+    content: `<identity>You are '${name}', role: ${role}, team: ${teamName}. Continue your work.</identity>`,
+  };
+}
+
+// -- Autonomous TeammateManager --
 interface TeamMember {
   name: string;
   role: string;
@@ -187,6 +253,14 @@ class TeammateManager {
     return this.config.members.find((m) => m.name === name);
   }
 
+  private setStatus(name: string, status: TeamMember['status']): void {
+    const member = this.findMember(name);
+    if (member && member.status !== 'shutdown') {
+      member.status = status;
+      this.saveConfig();
+    }
+  }
+
   async spawn(name: string, role: string, prompt: string): Promise<string> {
     const member = this.findMember(name);
     if (member) {
@@ -201,7 +275,7 @@ class TeammateManager {
     this.saveConfig();
 
     // Start teammate as async function (fire and forget, but track the promise)
-    const promise = this.teammateLoop(name, role, prompt).catch((err) => {
+    const promise = this.loop(name, role, prompt).catch((err) => {
       console.error(chalk.red(`[${name}] Error: ${err.message}`));
     });
     this.teammates.set(name, promise);
@@ -209,68 +283,138 @@ class TeammateManager {
     return `Spawned '${name}' (role: ${role})`;
   }
 
-  private async teammateLoop(name: string, role: string, prompt: string): Promise<void> {
-    const sysPrompt = `You are '${name}', role: ${role}, at ${WORKDIR}. Use send_message to communicate. Complete your task.`;
+  /**
+   * Main teammate loop with WORK and IDLE phases
+   */
+  private async loop(name: string, role: string, prompt: string): Promise<void> {
+    const teamName = this.config.team_name;
+    const sysPrompt = `You are '${name}', role: ${role}, team: ${teamName}, at ${WORKDIR}. Use idle tool when you have no more work. You will auto-claim new tasks.`;
     const messages: Message[] = [{ role: 'user', content: prompt }];
     const tools = this.getTeammateTools();
 
     // Register history for dump functionality
     histories.set(name, messages);
 
-    // NOTE: 50 iteration limit is a safety measure to prevent runaway teammates.
-    // This is replaced in s10_team_protocols with proper shutdown handling via
-    // shutdown_request/shutdown_response message types.
-    for (let i = 0; i < 50; i++) {
-      // Read inbox
-      const inbox = BUS.readInbox(name);
-      for (const msg of inbox) {
-        messages.push({ role: 'user', content: JSON.stringify(msg) });
+    while (true) {
+      // -- WORK PHASE: standard agent loop --
+      let idleRequested = false;
+
+      while (true) {
+        // Check inbox
+        const inbox = BUS.readInbox(name);
+        for (const msg of inbox) {
+          if (msg.type === 'shutdown_request') {
+            this.setStatus(name, 'shutdown');
+            return;
+          }
+          messages.push({ role: 'user', content: JSON.stringify(msg) });
+        }
+
+        try {
+          const response = await ollama.chat({
+            model: MODEL,
+            messages: [{ role: 'system', content: sysPrompt }, ...messages],
+            tools,
+          });
+
+          const assistantMessage = response.message;
+          messages.push({
+            role: 'assistant',
+            content: assistantMessage.content || '',
+            tool_calls: assistantMessage.tool_calls,
+          });
+
+          // If no tool calls, we're done with work phase
+          if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
+            break;
+          }
+
+          // Execute tool calls
+          for (const toolCall of assistantMessage.tool_calls) {
+            const args = toolCall.function.arguments as Record<string, unknown>;
+            const toolName = toolCall.function.name;
+
+            let output: string;
+            if (toolName === 'idle') {
+              idleRequested = true;
+              output = 'Entering idle phase. Will poll for new tasks.';
+            } else {
+              output = this.execTool(name, toolName, args);
+            }
+
+            console.log(chalk.gray(`  [${name}] ${toolName}: ${output.slice(0, 120)}`));
+            messages.push({
+              role: 'tool',
+              content: `tool call ${toolName} finished. ${output}`,
+            });
+
+            // Check if shutdown was approved
+            if (toolName === 'shutdown_response' && args.approve === true) {
+              this.setStatus(name, 'shutdown');
+              return;
+            }
+          }
+
+          // If idle requested, break out of work phase
+          if (idleRequested) {
+            break;
+          }
+        } catch {
+          this.setStatus(name, 'idle');
+          return;
+        }
       }
 
-      try {
-        const response = await ollama.chat({
-          model: MODEL,
-          messages: [{ role: 'system', content: sysPrompt }, ...messages],
-          tools,
-        });
+      // -- IDLE PHASE: poll for inbox messages and unclaimed tasks --
+      this.setStatus(name, 'idle');
+      let resume = false;
+      const polls = Math.floor(IDLE_TIMEOUT / Math.max(POLL_INTERVAL, 1));
 
-        const assistantMessage = response.message;
-        messages.push({
-          role: 'assistant',
-          content: assistantMessage.content || '',
-          tool_calls: assistantMessage.tool_calls,
-        });
+      for (let i = 0; i < polls; i++) {
+        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
 
-        // If no tool calls, we're done
-        if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
+        // Check inbox
+        const inbox = BUS.readInbox(name);
+        if (inbox.length > 0) {
+          for (const msg of inbox) {
+            if (msg.type === 'shutdown_request') {
+              this.setStatus(name, 'shutdown');
+              return;
+            }
+            messages.push({ role: 'user', content: JSON.stringify(msg) });
+          }
+          resume = true;
           break;
         }
 
-        // Execute tool calls
-        for (const toolCall of assistantMessage.tool_calls) {
-          const args = toolCall.function.arguments as Record<string, unknown>;
-          const toolName = toolCall.function.name;
-          const output = this.execTool(name, toolName, args);
-          console.log(chalk.gray(`  [${name}] ${toolName}: ${output.slice(0, 120)}`));
-          messages.push({
-            role: 'tool',
-            content: `tool call ${toolName} finished. ${output}`,
-          });
+        // Scan for unclaimed tasks
+        const unclaimed = scanUnclaimedTasks();
+        if (unclaimed.length > 0) {
+          const task = unclaimed[0];
+          claimTask(task.id, name);
+          const taskPrompt = `<auto-claimed>Task #${task.id}: ${task.subject}\n${task.description || ''}</auto-claimed>`;
+
+          // Identity re-injection if messages are short (context was compressed)
+          if (messages.length <= 3) {
+            messages.unshift(makeIdentityBlock(name, role, teamName));
+            messages.splice(1, 0, { role: 'assistant', content: `I am ${name}. Continuing.` });
+          }
+
+          messages.push({ role: 'user', content: taskPrompt });
+          messages.push({ role: 'assistant', content: `Claimed task #${task.id}. Working on it.` });
+          resume = true;
+          break;
         }
-      } catch {
-        break;
       }
-    }
 
-    // Set status to idle when done
-    this.updateStatus(name, 'idle');
-  }
+      if (!resume) {
+        // Timeout - shutdown
+        this.setStatus(name, 'shutdown');
+        return;
+      }
 
-  private updateStatus(name: string, status: TeamMember['status']): void {
-    const member = this.findMember(name);
-    if (member && member.status !== 'shutdown') {
-      member.status = status;
-      this.saveConfig();
+      // Resume work phase
+      this.setStatus(name, 'working');
     }
   }
 
@@ -293,6 +437,30 @@ class TeammateManager {
     }
     if (toolName === 'read_inbox') {
       return JSON.stringify(BUS.readInbox(sender), null, 2);
+    }
+    if (toolName === 'shutdown_response') {
+      const reqId = args.request_id as string;
+      const approve = args.approve as boolean;
+      const reason = (args.reason as string) || '';
+
+      const req = shutdownRequests.get(reqId);
+      if (req) {
+        req.status = approve ? 'approved' : 'rejected';
+      }
+
+      BUS.send(sender, 'lead', reason, 'shutdown_response', { request_id: reqId, approve });
+      return `Shutdown ${approve ? 'approved' : 'rejected'}`;
+    }
+    if (toolName === 'plan_approval') {
+      const planText = (args.plan as string) || '';
+      const reqId = generateId();
+
+      planRequests.set(reqId, { from: sender, plan: planText, status: 'pending' });
+      BUS.send(sender, 'lead', planText, 'plan_approval_response', { request_id: reqId, plan: planText });
+      return `Plan submitted (request_id=${reqId}). Waiting for lead approval.`;
+    }
+    if (toolName === 'claim_task') {
+      return claimTask(args.task_id as number, sender);
     }
     return `Unknown tool: ${toolName}`;
   }
@@ -385,6 +553,58 @@ class TeammateManager {
           parameters: { type: 'object', properties: {} },
         },
       },
+      {
+        type: 'function',
+        function: {
+          name: 'shutdown_response',
+          description: 'Respond to a shutdown request. Approve to shut down, reject to keep working.',
+          parameters: {
+            type: 'object',
+            properties: {
+              request_id: { type: 'string', description: 'The request ID from shutdown_request' },
+              approve: { type: 'boolean', description: 'Whether to approve shutdown' },
+              reason: { type: 'string', description: 'Optional reason for response' },
+            },
+            required: ['request_id', 'approve'],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'plan_approval',
+          description: 'Submit a plan for lead approval. Provide plan text.',
+          parameters: {
+            type: 'object',
+            properties: {
+              plan: { type: 'string', description: 'Plan text to submit for approval' },
+            },
+            required: ['plan'],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'idle',
+          description: 'Signal that you have no more work. Enters idle polling phase where you will auto-claim new tasks.',
+          parameters: { type: 'object', properties: {} },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'claim_task',
+          description: 'Claim a task from the task board by ID.',
+          parameters: {
+            type: 'object',
+            properties: {
+              task_id: { type: 'integer', description: 'Task ID to claim' },
+            },
+            required: ['task_id'],
+          },
+        },
+      },
     ];
   }
 
@@ -425,6 +645,7 @@ class TeammateManager {
       await Promise.race([Promise.all(promises), timeout]);
     } catch (err) {
       console.error(chalk.yellow(`Warning: ${(err as Error).message}`));
+      // Don't throw - just return to prompt
     } finally {
       clearTimeout(logTimer);
     }
@@ -434,25 +655,25 @@ class TeammateManager {
 const TEAM = new TeammateManager(TEAM_DIR);
 
 // -- History store for dump functionality --
-// Stores message history for each agent (lead + teammates)
 const histories: Map<string, Message[]> = new Map();
 
-// -- Dump history to file --
+// -- Utility functions --
+function generateId(): string {
+  return Math.random().toString(36).substring(2, 10);
+}
+
 function dumpHistory(name: string): string {
   const messages = histories.get(name);
   if (!messages) {
     return `Error: No history found for '${name}'`;
   }
 
-  // Ensure .transcripts directory exists
   fs.mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
 
-  // Generate filename with timestamp
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const filename = `dump_${name}_${timestamp}.jsonl`;
   const filepath = path.join(TRANSCRIPTS_DIR, filename);
 
-  // Write each message as a JSON line
   const lines = messages.map((msg) => JSON.stringify(msg));
   fs.writeFileSync(filepath, lines.join('\n'), 'utf-8');
 
@@ -526,7 +747,37 @@ function runEdit(filePath: string, oldText: string, newText: string): string {
   }
 }
 
-// -- Lead tool dispatch (9 tools) --
+// -- Lead-specific protocol handlers --
+function handleShutdownRequest(teammate: string): string {
+  const reqId = generateId();
+  shutdownRequests.set(reqId, { target: teammate, status: 'pending' });
+  BUS.send('lead', teammate, 'Please shut down gracefully.', 'shutdown_request', { request_id: reqId });
+  return `Shutdown request ${reqId} sent to '${teammate}'`;
+}
+
+function handlePlanReview(requestId: string, approve: boolean, feedback: string = ''): string {
+  const req = planRequests.get(requestId);
+  if (!req) {
+    return `Error: Unknown plan request_id '${requestId}'`;
+  }
+  req.status = approve ? 'approved' : 'rejected';
+  BUS.send('lead', req.from, feedback, 'plan_approval_response', {
+    request_id: requestId,
+    approve,
+    feedback,
+  });
+  return `Plan ${req.status} for '${req.from}'`;
+}
+
+function checkShutdownStatus(requestId: string): string {
+  const req = shutdownRequests.get(requestId);
+  if (!req) {
+    return JSON.stringify({ error: 'not found' });
+  }
+  return JSON.stringify({ request_id: requestId, target: req.target, status: req.status });
+}
+
+// -- Lead tool dispatch (14 tools) --
 type ToolHandler = (args: Record<string, unknown>) => string | Promise<string>;
 
 const TOOL_HANDLERS: Record<string, ToolHandler> = {
@@ -534,13 +785,18 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   read_file: (args) => runRead(args.path as string, args.limit as number | undefined),
   write_file: (args) => runWrite(args.path as string, args.content as string),
   edit_file: (args) => runEdit(args.path as string, args.old_text as string, args.new_text as string),
-  spawn_teammate: async (args) =>
-    TEAM.spawn(args.name as string, args.role as string, args.prompt as string),
+  spawn_teammate: async (args) => TEAM.spawn(args.name as string, args.role as string, args.prompt as string),
   list_teammates: () => TEAM.listAll(),
   send_message: (args) =>
     BUS.send('lead', args.to as string, args.content as string, args.msg_type as string | undefined),
   read_inbox: () => JSON.stringify(BUS.readInbox('lead'), null, 2),
   broadcast: (args) => BUS.broadcast('lead', args.content as string, TEAM.memberNames()),
+  shutdown_request: (args) => handleShutdownRequest(args.teammate as string),
+  shutdown_response: (args) => checkShutdownStatus(args.request_id as string),
+  plan_approval: (args) =>
+    handlePlanReview(args.request_id as string, args.approve as boolean, (args.feedback as string) || ''),
+  idle: () => 'Lead does not idle.',
+  claim_task: (args) => claimTask(args.task_id as number, 'lead'),
 };
 
 // Lead tools
@@ -607,7 +863,7 @@ const TOOLS: Tool[] = [
     type: 'function',
     function: {
       name: 'spawn_teammate',
-      description: 'Spawn a persistent teammate that runs its own agent loop.',
+      description: 'Spawn an autonomous teammate.',
       parameters: {
         type: 'object',
         properties: {
@@ -623,7 +879,7 @@ const TOOLS: Tool[] = [
     type: 'function',
     function: {
       name: 'list_teammates',
-      description: 'List all teammates with name, role, status.',
+      description: 'List all teammates.',
       parameters: { type: 'object', properties: {} },
     },
   },
@@ -631,7 +887,7 @@ const TOOLS: Tool[] = [
     type: 'function',
     function: {
       name: 'send_message',
-      description: 'Send a message to a teammate inbox.',
+      description: 'Send a message to a teammate.',
       parameters: {
         type: 'object',
         properties: {
@@ -666,6 +922,72 @@ const TOOLS: Tool[] = [
           content: { type: 'string', description: 'Message content' },
         },
         required: ['content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'shutdown_request',
+      description: 'Request a teammate to shut down gracefully. Returns a request_id for tracking.',
+      parameters: {
+        type: 'object',
+        properties: {
+          teammate: { type: 'string', description: 'Teammate name to shut down' },
+        },
+        required: ['teammate'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'shutdown_response',
+      description: 'Check the status of a shutdown request by request_id.',
+      parameters: {
+        type: 'object',
+        properties: {
+          request_id: { type: 'string', description: 'Request ID to check' },
+        },
+        required: ['request_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'plan_approval',
+      description: 'Approve or reject a teammate plan. Provide request_id + approve + optional feedback.',
+      parameters: {
+        type: 'object',
+        properties: {
+          request_id: { type: 'string', description: 'Plan request ID' },
+          approve: { type: 'boolean', description: 'Whether to approve the plan' },
+          feedback: { type: 'string', description: 'Optional feedback for the teammate' },
+        },
+        required: ['request_id', 'approve'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'idle',
+      description: 'Enter idle state (for lead -- rarely used).',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'claim_task',
+      description: 'Claim a task from the board by ID.',
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'integer', description: 'Task ID to claim' },
+        },
+        required: ['task_id'],
       },
     },
   },
@@ -733,6 +1055,18 @@ async function agentLoop(messages: Message[]): Promise<void> {
       } else if (toolName === 'read_inbox') {
         console.log(chalk.blue('[inbox]'));
         console.log(output);
+      } else if (toolName === 'shutdown_request') {
+        console.log(chalk.red('[shutdown]') + ` request sent`);
+        console.log(output);
+      } else if (toolName === 'shutdown_response') {
+        console.log(chalk.red('[shutdown]') + ` status check`);
+        console.log(output);
+      } else if (toolName === 'plan_approval') {
+        console.log(chalk.green('[plan]') + ` review`);
+        console.log(output);
+      } else if (toolName === 'claim_task') {
+        console.log(chalk.cyan('[claim]') + ` task #${args.task_id}`);
+        console.log(output);
       } else {
         console.log(`> ${toolName}: ${output.slice(0, 200)}`);
       }
@@ -746,11 +1080,35 @@ async function agentLoop(messages: Message[]): Promise<void> {
   }
 }
 
+// -- List tasks command --
+function listTasks(): void {
+  if (!fs.existsSync(TASKS_DIR)) {
+    console.log('No tasks directory.');
+    return;
+  }
+  const files = fs.readdirSync(TASKS_DIR).filter((f) => f.startsWith('task_') && f.endsWith('.json')).sort();
+  if (files.length === 0) {
+    console.log('No tasks.');
+    return;
+  }
+  for (const file of files) {
+    try {
+      const task = JSON.parse(fs.readFileSync(path.join(TASKS_DIR, file), 'utf-8')) as Task;
+      const marker: Record<string, string> = { pending: '[ ]', in_progress: '[>]', completed: '[x]' };
+      const status = marker[task.status] || '[?]';
+      const owner = task.owner ? ` @${task.owner}` : '';
+      console.log(`  ${status} #${task.id}: ${task.subject}${owner}`);
+    } catch {
+      // Skip malformed files
+    }
+  }
+}
+
 // REPL
 async function main() {
-  console.log(chalk.cyan(`s09 (Ollama: ${MODEL})`));
-  console.log('Agent teams enabled. Teammates persist in .team/ directory.');
-  console.log('Commands: /team, /inbox, /dump <name>\n');
+  console.log(chalk.cyan(`s11 (Ollama: ${MODEL})`));
+  console.log('Autonomous agents enabled. Teammates find work themselves.');
+  console.log('Commands: /team, /inbox, /tasks, /dump <name>\n');
   const history: Message[] = [];
 
   // Register lead's history for dump functionality
@@ -766,7 +1124,7 @@ async function main() {
 
   while (true) {
     try {
-      const query = await prompt(chalk.cyan('s09 >> '));
+      const query = await prompt(chalk.cyan('s11 >> '));
       if (['q', 'exit', ''].includes(query.trim().toLowerCase())) {
         break;
       }
@@ -778,6 +1136,10 @@ async function main() {
         console.log(JSON.stringify(BUS.readInbox('lead'), null, 2));
         continue;
       }
+      if (query.trim() === '/tasks') {
+        listTasks();
+        continue;
+      }
       if (query.trim().startsWith('/dump ')) {
         const name = query.trim().slice(6).trim();
         console.log(dumpHistory(name));
@@ -786,8 +1148,8 @@ async function main() {
       history.push({ role: 'user', content: query });
       await agentLoop(history);
 
-      // Wait for all teammates to finish
-      await TEAM.waitForAll();
+      // Wait for all teammates to finish (with timeout)
+      await TEAM.waitForAll(30000);
 
       // Print final response
       const lastMsg = history[history.length - 1];

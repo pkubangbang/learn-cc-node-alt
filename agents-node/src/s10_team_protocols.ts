@@ -245,6 +245,10 @@ class TeammateManager {
       // Read inbox
       const inbox = BUS.readInbox(name);
       for (const msg of inbox) {
+        if (msg.type === 'shutdown_request') {
+          this.updateStatus(name, 'shutdown');
+          return;
+        }
         messages.push({ role: 'user', content: JSON.stringify(msg) });
       }
 
@@ -502,6 +506,34 @@ class TeammateManager {
 
   memberNames(): string[] {
     return this.config.members.map((m) => m.name);
+  }
+
+  async waitForAll(timeoutMs: number = 30000): Promise<void> {
+    const promises = Array.from(this.teammates.values());
+    if (promises.length === 0) return;
+
+    // Log after 1 second if still waiting (only show teammates still working)
+    const logTimer = setTimeout(() => {
+      const workingNames = this.config.members
+        .filter(m => m.status === 'working')
+        .map(m => m.name);
+      if (workingNames.length > 0) {
+        console.log(chalk.gray(`[hold] waiting for ${workingNames.join(', ')} to finish`));
+      }
+    }, 1000);
+
+    const timeout = new Promise<void>((_, reject) =>
+      setTimeout(() => reject(new Error(`waitForAll timed out after ${timeoutMs}ms`)), timeoutMs)
+    );
+
+    try {
+      await Promise.race([Promise.all(promises), timeout]);
+    } catch (err) {
+      console.error(chalk.yellow(`Warning: ${(err as Error).message}`));
+      // Don't throw - just return to prompt
+    } finally {
+      clearTimeout(logTimer);
+    }
   }
 }
 
@@ -945,6 +977,9 @@ async function main() {
       }
       history.push({ role: 'user', content: query });
       await agentLoop(history);
+
+      // Wait for all teammates to finish (with timeout)
+      await TEAM.waitForAll(30000);
 
       // Print final response
       const lastMsg = history[history.length - 1];
