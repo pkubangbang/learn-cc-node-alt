@@ -207,6 +207,15 @@ class TeammateManager {
   private processes: Map<string, ChildProcess> = new Map();
   private status: Map<string, 'working' | 'idle' | 'shutdown'> = new Map();
 
+  /**
+   * Get list of teammates currently in 'working' status
+   */
+  getWorkingTeammates(): string[] {
+    return Array.from(this.status.entries())
+      .filter(([_, s]) => s === 'working')
+      .map(([name]) => name);
+  }
+
   constructor(teamDir: string) {
     this.dir = teamDir;
     fs.mkdirSync(this.dir, { recursive: true });
@@ -414,50 +423,70 @@ class TeammateManager {
   }
 
   /**
-   * Wait for all teammate processes to finish (like Python's process.join())
-   * Uses native process 'exit' events, not spawn promises
+   * Nudge teammates to stop working and poll until all settle.
+   * Returns status changes to be injected into agent messages.
    */
-  async waitForAll(timeoutMs: number = 30000): Promise<void> {
-    const procs = Array.from(this.processes.entries());
-    if (procs.length === 0) return;
+  async bounce(
+    messages: Message[],
+    timeoutMs: number = 30000,
+    pollIntervalMs: number = 1000
+  ): Promise<{ allSettled: boolean; statusChanges: string[] }> {
+    const teammates = Array.from(this.status.entries());
 
-    // Log after 1 second if still waiting
-    const logTimer = setTimeout(() => {
-      const working = Array.from(this.status.entries())
-        .filter(([_, s]) => s === 'working')
-        .map(([name]) => name);
-      if (working.length > 0) {
-        console.log(chalk.gray(`[hold] waiting for ${working.join(', ')} to finish`));
-      }
-    }, 1000);
-
-    // Create one promise per process that resolves on 'exit' event
-    const exitPromises = procs.map(([name, proc]) =>
-      new Promise<void>((resolve) => {
-        // If process already exited, resolve immediately
-        if (!proc.connected && proc.exitCode !== null) {
-          resolve();
-          return;
-        }
-        // Otherwise wait for exit event
-        proc.once('exit', () => {
-          resolve();
-        });
-      })
-    );
-
-    // Race between all processes exiting and timeout
-    const timeoutPromise = new Promise<void>((_, reject) =>
-      setTimeout(() => reject(new Error(`waitForAll timed out after ${timeoutMs}ms`)), timeoutMs)
-    );
-
-    try {
-      await Promise.race([Promise.all(exitPromises), timeoutPromise]);
-    } catch (err) {
-      console.error(chalk.yellow(`Warning: ${(err as Error).message}`));
-    } finally {
-      clearTimeout(logTimer);
+    // If no teammates, return immediately
+    if (teammates.length === 0) {
+      return { allSettled: true, statusChanges: [] };
     }
+
+    // Track previous status to detect changes
+    const previousStatus = new Map<string, 'working' | 'idle' | 'shutdown'>();
+    for (const [name, status] of teammates) {
+      previousStatus.set(name, status);
+    }
+
+    // Send idle nudge to all working teammates (regular message type)
+    for (const [name, status] of teammates) {
+      if (status === 'working') {
+        this.sendTo(name, 'Please finish your current work and enter idle state.', 'message');
+      }
+    }
+
+    const startTime = Date.now();
+    const statusChanges: string[] = [];
+
+    while (Date.now() - startTime < timeoutMs) {
+      // Check if all teammates are idle or shutdown
+      const allSettled = Array.from(this.status.values()).every(
+        (s) => s === 'idle' || s === 'shutdown'
+      );
+
+      // Track status changes for terminal output
+      for (const [name, currentStatus] of this.status) {
+        const prev = previousStatus.get(name);
+        if (prev !== currentStatus) {
+          const change = `${name}: ${prev || 'unknown'} → ${currentStatus}`;
+          statusChanges.push(change);
+          console.log(chalk.gray(`[${change}]`));
+          previousStatus.set(name, currentStatus);
+        }
+      }
+
+      if (allSettled) {
+        // Inject summary into messages for LLM context
+        if (statusChanges.length > 0) {
+          messages.push({
+            role: 'user',
+            content: `Teammate status updates:\n${statusChanges.map((c) => `  - ${c}`).join('\n')}\n\nAll teammates have settled.`,
+          });
+        }
+        return { allSettled: true, statusChanges };
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+
+    // Timeout - return with pending teammates info
+    return { allSettled: false, statusChanges };
   }
 
   /**
@@ -857,9 +886,20 @@ async function agentLoop(messages: Message[]): Promise<void> {
       tool_calls: assistantMessage.tool_calls,
     });
 
-    // If no tool calls, we're done
+    // If no tool calls, check if teammates have settled
     if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
-      return;
+      const result = await TEAM.bounce(messages, 30000, 1000);
+      if (result.allSettled) {
+        return; // All teammates settled, exit loop
+      }
+      // Timeout - inject timeout message
+      const stillWorking = TEAM.getWorkingTeammates();
+      messages.push({
+        role: 'user',
+        content: `Timeout waiting for teammates. Still working: ${stillWorking.join(', ')}. What would you like to do?`,
+      });
+      // Continue loop to let agent respond to timeout
+      continue;
     }
 
     // Execute each tool call
@@ -1002,9 +1042,6 @@ async function main() {
       }
       history.push({ role: 'user', content: query });
       await agentLoop(history);
-
-      // Wait for all teammates to finish (with timeout)
-      await TEAM.waitForAll(30000);
 
       // Print final response
       const lastMsg = history[history.length - 1];

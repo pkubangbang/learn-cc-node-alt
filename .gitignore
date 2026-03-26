@@ -228,3 +228,5 @@ analysis_progress.md
 
 # Claude Code local config
 /.claude/
+
+.worktrees/

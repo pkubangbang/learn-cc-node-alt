@@ -16,7 +16,7 @@
     "s10": "tsx src/s10_team_protocols.ts",
     "s11": "tsx src/s11_autonomous_agents.ts",
     "s12": "tsx src/s12_worktree_task_isolation.ts",
-    "s-full": "tsx src/s_full.ts",
+    "s-full": "tsx src/s_full/index.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.ts\"",
