@@ -103,3 +103,119 @@ async function agentLoop(messages: Message[]): Promise<void> {
 ```
 
 The loop never changes. Each session adds harness mechanisms around it.
+
+---
+
+# s_full Agent System
+
+The `s_full` agent is a full-featured AI coding agent combining all mechanisms from s03-s12 into a single, production-ready system.
+
+## Key Features
+
+- **Modular Tool Architecture**: Tools are dynamically loaded with scope-based visibility (main/child/bg)
+- **Subagent Delegation**: Spawn isolated subagents for focused exploration or work
+- **Teammate System**: Spawn autonomous teammate processes that can work independently
+- **Task Management**: File-based task board with dependencies, ownership, and auto-claim
+- **Context Management**: Auto-compact and micro-compact for long conversations
+- **Background Tasks**: Run long-running commands asynchronously
+- **Worktree Isolation**: Create isolated git worktrees for parallel development
+- **Skill Loading**: On-demand loading of specialized knowledge from SKILL.md files
+
+## REPL Commands
+
+| Command | Description |
+|---------|-------------|
+| `/compact` | Manually compress conversation context |
+| `/tasks` | List all tasks on the task board |
+| `/team` | List all teammates with their status |
+| `/inbox` | Show inbox status (handled via IPC for teammates) |
+| `/tools` | List all loaded tools by scope (reloads tools) |
+| `q` / `exit` | Exit the agent |
+
+## Available Tools
+
+### File Operations
+- `bash` - Run shell commands (scope: main, child, bg)
+- `read_file` - Read file contents
+- `write_file` - Write content to file
+- `edit_file` - Replace exact text in file
+
+### Task Management (s03, s07)
+- `TodoWrite` - In-memory todo list (s03)
+- `task_create` / `task_get` / `task_update` / `task_list` - File-based task board (s07)
+- `claim_task` - Claim an unclaimed task
+
+### Skill Loading (s05)
+- `load_skill` - Load specialized knowledge from SKILL.md
+
+### Context Compression (s06)
+- `compress` - Manually trigger context compression
+
+### Background Tasks (s08)
+- `background_run` - Run command asynchronously
+- `check_background` - Check background task status
+
+### Teammate System (s09/s11)
+- `spawn_teammate` - Spawn autonomous teammate process
+- `list_teammates` - List teammates with status
+- `send_message` - Send message to teammate
+- `read_inbox` - Read queued messages
+- `broadcast` - Send message to all teammates
+
+### Protocols (s10)
+- `shutdown_request` - Request graceful teammate shutdown
+- `plan_approval` - Approve/reject teammate's plan
+
+### Autonomous Agents (s11)
+- `idle` - Signal no more work, enter polling phase
+
+### Subagent (s04)
+- `task` - Spawn subagent for isolated work
+
+### Worktree Isolation (s12)
+- `worktree_create` / `worktree_list` / `worktree_status`
+- `worktree_run` / `worktree_remove` / `worktree_keep`
+- `worktree_events` - View lifecycle events
+
+## Tool Scopes
+
+- **main**: Available to lead agent (all tools)
+- **child**: Available to teammate processes (file ops, tasks, messaging, self-management)
+- **bg**: Available to background workers (file ops only)
+
+## Teammate System
+
+Teammates run as child Node.js processes with their own agent loops. They:
+
+1. Process inbox messages in work phase
+2. Execute tools until work is done
+3. Enter idle phase and poll for new tasks
+4. Auto-claim unclaimed tasks with no blocking dependencies
+5. Exit after 60s idle timeout
+
+## Directory Structure
+
+```
+agents-node/src/s_full/
+├── index.ts           # Main agent loop + REPL
+├── context.ts         # Context creation + TeammateManager
+├── types.ts           # Type definitions + managers
+├── teammate-worker.ts # Child process worker
+└── tools/             # Modular tool definitions
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
+| `OLLAMA_MODEL` | `glm-5:cloud` | Model name to use |
+| `OLLAMA_API_KEY` | - | API key for cloud Ollama |
+
+## Troubleshooting
+
+- **"Not in a git repository"**: Worktree tools require a git repository. Run `git init`.
+- **"Unknown skill"**: Skills must be in `skills/{name}/SKILL.md`.
+- **"Path escapes workspace"**: File operations are sandboxed. Use relative paths.
+- **Context too large**: Auto-compact triggers at 50k tokens. Use `/compact`.
+- **Background task timeout**: 5-minute timeout. Use worktrees for longer tasks.

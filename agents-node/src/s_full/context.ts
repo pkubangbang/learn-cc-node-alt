@@ -80,7 +80,12 @@ export class TeammateManager {
 
   private loadConfig(): TeamConfig {
     if (fs.existsSync(this.configPath)) {
-      return JSON.parse(fs.readFileSync(this.configPath, 'utf-8')) as TeamConfig;
+      try {
+        return JSON.parse(fs.readFileSync(this.configPath, 'utf-8')) as TeamConfig;
+      } catch {
+        console.error(`Warning: Failed to parse ${this.configPath}, using default config`);
+        return { team_name: 'default', members: [] };
+      }
     }
     return { team_name: 'default', members: [] };
   }

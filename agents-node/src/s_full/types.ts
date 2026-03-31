@@ -242,7 +242,7 @@ export interface Task {
   id: number;
   subject: string;
   description?: string;
-  status: 'pending' | 'in_progress' | 'completed';
+  status: 'pending' | 'in_progress' | 'completed' | 'deleted';
   owner?: string;
   worktree?: string;
   blockedBy?: number[];
@@ -276,7 +276,11 @@ export class TaskManager {
     if (!fs.existsSync(p)) {
       throw new Error(`Task ${taskId} not found`);
     }
-    return JSON.parse(fs.readFileSync(p, 'utf-8')) as Task;
+    try {
+      return JSON.parse(fs.readFileSync(p, 'utf-8')) as Task;
+    } catch {
+      throw new Error(`Task ${taskId} has corrupted JSON`);
+    }
   }
 
   private save(task: Task): void {
@@ -326,10 +330,14 @@ export class TaskManager {
       if (status === 'completed') {
         const files = fs.readdirSync(this.dir).filter((f: string) => f.startsWith('task_') && f.endsWith('.json'));
         for (const file of files) {
-          const t = JSON.parse(fs.readFileSync(path.join(this.dir, file), 'utf-8')) as Task;
-          if (t.blockedBy?.includes(taskId)) {
-            t.blockedBy = t.blockedBy.filter((id) => id !== taskId);
-            fs.writeFileSync(path.join(this.dir, `task_${t.id}.json`), JSON.stringify(t, null, 2), 'utf-8');
+          try {
+            const t = JSON.parse(fs.readFileSync(path.join(this.dir, file), 'utf-8')) as Task;
+            if (t.blockedBy?.includes(taskId)) {
+              t.blockedBy = t.blockedBy.filter((id) => id !== taskId);
+              fs.writeFileSync(path.join(this.dir, `task_${t.id}.json`), JSON.stringify(t, null, 2), 'utf-8');
+            }
+          } catch {
+            // Skip corrupted task files
           }
         }
       }
@@ -400,6 +408,45 @@ export class TaskManager {
     return `Claimed task #${taskId} for ${owner}`;
   }
 
+  /**
+   * Atomically try to claim a task. Returns null if already claimed or not found.
+   * This is safer than claim() for concurrent scenarios.
+   */
+  tryClaim(taskId: number, owner: string): { success: boolean; task: Task | null; message: string } {
+    try {
+      const task = this.load(taskId);
+
+      // Check if already claimed by someone else
+      if (task.owner && task.owner !== owner) {
+        return { success: false, task, message: `Task #${taskId} is already claimed by ${task.owner}` };
+      }
+
+      // Check if status allows claiming
+      if (task.status !== 'pending') {
+        return { success: false, task, message: `Task #${taskId} is ${task.status}, not pending` };
+      }
+
+      // Re-read to check for race condition (file could have changed)
+      const refreshed = this.load(taskId);
+      if (refreshed.owner && refreshed.owner !== owner) {
+        return { success: false, task: refreshed, message: `Task #${taskId} was just claimed by ${refreshed.owner}` };
+      }
+      if (refreshed.status !== 'pending') {
+        return { success: false, task: refreshed, message: `Task #${taskId} is now ${refreshed.status}` };
+      }
+
+      // Safe to claim
+      refreshed.owner = owner;
+      refreshed.status = 'in_progress';
+      refreshed.updated_at = Date.now();
+      this.save(refreshed);
+
+      return { success: true, task: refreshed, message: `Claimed task #${taskId} for ${owner}` };
+    } catch {
+      return { success: false, task: null, message: `Task #${taskId} not found` };
+    }
+  }
+
   bindWorktree(taskId: number, worktree: string, owner: string = ''): string {
     const task = this.load(taskId);
     task.worktree = worktree;
@@ -452,8 +499,21 @@ export class BackgroundManager {
       command,
     });
 
-    // Fire and forget
-    this.executeCommand(taskId, command).catch(() => {});
+    // Fire and forget with proper error logging
+    this.executeCommand(taskId, command).catch((err) => {
+      console.error(`Background task ${taskId} failed to start: ${(err as Error).message}`);
+      const task = this.tasks.get(taskId);
+      if (task) {
+        task.status = 'error';
+        task.result = `Error: ${(err as Error).message}`;
+      }
+      this.enqueueNotification({
+        taskId,
+        status: 'error',
+        command: command.slice(0, 80),
+        result: `Error: ${(err as Error).message}`,
+      });
+    });
 
     return `Background task ${taskId} started: ${command.slice(0, 80)}`;
   }
@@ -684,7 +744,12 @@ export class WorktreeManager implements IWorktreeManager {
   }
 
   private loadIndex(): WorktreeIndex {
-    return JSON.parse(fs.readFileSync(this.indexPath, 'utf-8')) as WorktreeIndex;
+    try {
+      return JSON.parse(fs.readFileSync(this.indexPath, 'utf-8')) as WorktreeIndex;
+    } catch {
+      // Return empty index if file is corrupted or missing
+      return { worktrees: [] };
+    }
   }
 
   private saveIndex(data: WorktreeIndex): void {

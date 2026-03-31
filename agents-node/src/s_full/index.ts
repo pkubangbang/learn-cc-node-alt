@@ -309,6 +309,8 @@ async function main() {
       }
     } catch (err) {
       console.error('Error:', err);
+      // Ensure child processes are cleaned up on error
+      ctx.teammateManager.killAll();
     }
   }
 

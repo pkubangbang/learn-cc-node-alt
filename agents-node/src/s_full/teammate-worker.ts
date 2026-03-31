@@ -144,8 +144,9 @@ Available tools: bash, read_file, write_file, edit_file, todo_write, load_skill,
     let idleRequested = false;
 
     // Process queued inbox messages before work
-    const pendingMessages = inboxMessages.filter((m) => m.type === 'message');
-    inboxMessages = inboxMessages.filter((m) => m.type !== 'message');
+    // Atomically drain all messages from inbox (safe in single-threaded Node.js)
+    const pendingMessages = [...inboxMessages];
+    inboxMessages = [];
 
     for (const msg of pendingMessages) {
       if (msg.type === 'message') {
@@ -157,8 +158,8 @@ Available tools: bash, read_file, write_file, edit_file, todo_write, load_skill,
     }
 
     // Check for shutdown before work
-    const shutdownMsg = inboxMessages.find((m) => m.type === 'shutdown');
-    if (shutdownMsg) {
+    const hasShutdown = pendingMessages.some((m) => m.type === 'shutdown');
+    if (hasShutdown) {
       sendStatus('shutdown');
       process.exit(0);
     }
@@ -200,15 +201,16 @@ Available tools: bash, read_file, write_file, edit_file, todo_write, load_skill,
             args._owner = teammateName;
             output = await loader.execute(ctx, toolName, args);
           } else if (toolName === 'read_inbox') {
-            // Drain inbox messages
-            const msgs = inboxMessages
+            // Drain inbox messages (atomically copy and clear)
+            const allMsgs = [...inboxMessages];
+            inboxMessages = [];
+            const msgs = allMsgs
               .filter((m) => m.type === 'message')
               .map((m) => ({
                 type: (m as { msgType: string }).msgType,
                 from: (m as { from: string }).from,
                 content: (m as { content: string }).content,
               }));
-            inboxMessages = inboxMessages.filter((m) => m.type !== 'message');
             output = msgs.length > 0 ? JSON.stringify(msgs, null, 2) : 'Inbox is empty.';
           } else {
             // All other tools go through loader
@@ -238,20 +240,21 @@ Available tools: bash, read_file, write_file, edit_file, todo_write, load_skill,
     let resume = false;
 
     while (Date.now() - startTime < IDLE_TIMEOUT) {
-      // Check inbox for new work
-      const newMessages = inboxMessages.filter((m) => m.type === 'message');
-      if (newMessages.length > 0) {
+      // Check inbox for new work (snapshot check)
+      const hasMessages = inboxMessages.some((m) => m.type === 'message');
+      if (hasMessages) {
         resume = true;
         break;
       }
 
       // Check for shutdown
-      if (inboxMessages.some((m) => m.type === 'shutdown')) {
+      const hasShutdown = inboxMessages.some((m) => m.type === 'shutdown');
+      if (hasShutdown) {
         sendStatus('shutdown');
         process.exit(0);
       }
 
-      // Auto-claim unclaimed tasks using context's taskManager
+      // Auto-claim unclaimed tasks using atomic tryClaim
       const tasks = ctx.taskManager.list();
       const unclaimed = tasks.filter(
         (t) => t.status === 'pending' && !t.owner && (!t.blockedBy || t.blockedBy.length === 0)
@@ -259,21 +262,28 @@ Available tools: bash, read_file, write_file, edit_file, todo_write, load_skill,
 
       if (unclaimed.length > 0) {
         const task = unclaimed[0];
-        ctx.taskManager.claim(task.id, teammateName);
 
-        // Identity re-injection if context was compressed (short message history)
-        if (messages.length <= 3) {
-          messages.unshift(makeIdentityBlock(teammateName, teammateRole, teamName));
-          messages.splice(1, 0, { role: 'assistant', content: `I am ${teammateName}. Continuing.` });
+        // Use atomic tryClaim to prevent race conditions
+        const result = ctx.taskManager.tryClaim(task.id, teammateName);
+
+        if (result.success) {
+          // Identity re-injection if context was compressed (short message history)
+          if (messages.length <= 3) {
+            messages.unshift(makeIdentityBlock(teammateName, teammateRole, teamName));
+            messages.splice(1, 0, { role: 'assistant', content: `I am ${teammateName}. Continuing.` });
+          }
+
+          messages.push({
+            role: 'user',
+            content: `<auto-claimed>Task #${task.id}: ${task.subject}\n${task.description || ''}</auto-claimed>`,
+          });
+
+          resume = true;
+          break;
+        } else {
+          // Task was claimed by someone else, log and try next
+          sendLog(`Claim attempt failed: ${result.message}`);
         }
-
-        messages.push({
-          role: 'user',
-          content: `<auto-claimed>Task #${task.id}: ${task.subject}\n${task.description || ''}</auto-claimed>`,
-        });
-
-        resume = true;
-        break;
       }
 
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
@@ -312,6 +322,7 @@ process.on('message', (msg: ParentMessage) => {
     });
   } else {
     // Queue message for teammate loop to process
+    // Safe in Node.js single-threaded event loop
     inboxMessages.push(msg);
   }
 });
